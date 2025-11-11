@@ -1,0 +1,318 @@
+---
+title: "Jaccard Similarity: GM-GM vs GWM-HFN (SLIM time1)"
+format:
+  html:
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+# Load required packages
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(hdf5r)     # For MATLAB v7.3 (HDF5) .mat files
+  library(R.matlab)  # Fallback for non-HDF5 .mat files
+  library(ggplot2)
+  library(patchwork)
+  library(readr)
+  library(openxlsx)
+})
+```
+
+## Configuration
+
+```{r}
+# Input paths (update if needed)
+gm_path       <- "E:/Neuroimage/MyProject/GMWM_Network/Data/SLIM/GMGM_time1.mat"
+gwmhfn_path   <- "E:/Neuroimage/MyProject/GMWM_Network/Data/SLIM/GWM_HFN_time1.mat"
+net_index_path <- "E:/Neuroimage/MyProject/GMWM_Network/Data/AAL_7networkIndex.csv"
+
+# Figure output dir and SourceData workbook
+fig_dir   <- "E:/Neuroimage/MyProject/GMWM_Network/Code_R1/visualization/Figure5_CompareGMGM"
+# excel_file <- file.path(fig_dir, "Figure5_vsGMGM_SourceData.xlsx")
+
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# Sparsity grid (proportion of strongest edges to keep)
+sparsity_grid <- seq(0.01, 0.50, by = 0.01)
+
+# Constants
+n_regions <- 90
+
+# Excel helpers
+# wb <- if (file.exists(excel_file)) {
+#   loadWorkbook(excel_file)
+# } else {
+#   createWorkbook()
+# }
+# 
+# save_sheet <- function(wb, sheet_name, df) {
+#   # Excel sheet name limit is 31 chars; truncate if necessary
+#   if (nchar(sheet_name) > 31) sheet_name <- substr(sheet_name, 1, 31)
+#   if (sheet_name %in% names(wb)) removeWorksheet(wb, sheet_name)
+#   addWorksheet(wb, sheet_name)
+#   writeData(wb, sheet_name, df)
+# }
+```
+
+## IO helpers and data loading
+
+```{r}
+read_mat_dataset <- function(file, candidates) {
+  # Try HDF5 first
+  try_h5 <- try({
+    h5 <- H5File$new(file, mode = "r")
+    on.exit(try(h5$close_all(), silent = TRUE), add = TRUE)
+    for (nm in candidates) {
+      if (nm %in% names(h5)) {
+        return(h5[[nm]]$read())
+      }
+    }
+    stop("Dataset not found in HDF5: ", paste(candidates, collapse = ", "))
+  }, silent = TRUE)
+
+  if (!inherits(try_h5, "try-error")) return(try_h5)
+
+  # Fallback to R.matlab
+  m <- readMat(file)
+  for (nm in candidates) {
+    if (!is.null(m[[nm]])) return(m[[nm]])
+  }
+  stop("Dataset not found in MAT file: ", paste(candidates, collapse = ", "))
+}
+
+# Load matrices using the latest naming in SLIM time1_all files
+GM_GM   <- read_mat_dataset(gm_path,     c("time1.GMGM"))          # [90 x 90 x N]
+GWM_HFN <- read_mat_dataset(gwmhfn_path, "time1.GWM.HFN")    # [90 x 90 x N]
+
+# Ensure 3D shape
+if (length(dim(GM_GM)) == 2)   GM_GM   <- array(GM_GM,   dim = c(dim(GM_GM),   1))
+if (length(dim(GWM_HFN)) == 2) GWM_HFN <- array(GWM_HFN, dim = c(dim(GWM_HFN), 1))
+
+stopifnot(dim(GM_GM)[1] == n_regions, dim(GM_GM)[2] == n_regions)
+stopifnot(dim(GWM_HFN)[1] == n_regions, dim(GWM_HFN)[2] == n_regions)
+
+n_subject <- dim(GM_GM)[3]
+message(sprintf("Loaded SLIM time1: Subjects=%d, Regions=%d", n_subject, n_regions))
+```
+
+## Jaccard utilities
+
+```{r}
+# Lower-triangle mask (excluding diagonal)
+lower_mask <- lower.tri(diag(n_regions), diag = FALSE)
+n_edges_lower <- sum(lower_mask)
+
+# Binarize a weighted adjacency matrix by keeping exact top-k lower-triangle edges
+binarize_topk <- function(mat, sparsity) {
+  vec <- mat[lower_mask]
+  if (any(!is.finite(vec))) vec[!is.finite(vec)] <- -Inf
+  k <- max(1, round(n_edges_lower * sparsity))
+  ord <- order(vec, decreasing = TRUE, na.last = NA)
+  sel <- ord[seq_len(min(k, length(ord)))]
+  A <- matrix(FALSE, n_regions, n_regions)
+  A[lower_mask][sel] <- TRUE
+  A <- A | t(A)
+  diag(A) <- FALSE
+  A
+}
+
+# Jaccard index on lower-triangle
+jaccard_from_binary <- function(A, B) {
+  a <- A[lower_mask]
+  b <- B[lower_mask]
+  inter <- sum(a & b)
+  uni   <- sum(a | b)
+  if (uni == 0) return(NA_real_)
+  inter / uni
+}
+```
+
+## Subject-wise Jaccard across sparsity thresholds
+
+```{r}
+# Compute subject-wise Jaccard matrix [subjects x thresholds]
+jaccard_results <- matrix(NA_real_, nrow = n_subject, ncol = length(sparsity_grid))
+colnames(jaccard_results) <- paste0("thr_", sprintf("%.2f", sparsity_grid))
+rownames(jaccard_results) <- paste0("sub_", seq_len(n_subject))
+
+for (t in seq_along(sparsity_grid)) {
+  sp <- sparsity_grid[t]
+  for (s in seq_len(n_subject)) {
+    A_gmgm  <- binarize_topk(GM_GM[,,s],   sp)
+    A_hfn   <- binarize_topk(GWM_HFN[,,s], sp)
+    jaccard_results[s, t] <- jaccard_from_binary(A_gmgm, A_hfn)
+  }
+}
+
+# Summary statistics
+jaccard_means <- colMeans(jaccard_results, na.rm = TRUE)
+jaccard_sds   <- apply(jaccard_results, 2, sd, na.rm = TRUE)
+plot_data <- tibble(
+  Sparsity = sparsity_grid,
+  Mean_Jaccard = jaccard_means,
+  SD_Jaccard = jaccard_sds
+)
+
+# Save plotting data to SourceData (Figure 5E)
+# save_sheet(wb, "Figure5E_MeanJaccard_Curve", plot_data)
+
+# Line plot with ±1 SD ribbon
+
+p_global <- ggplot(plot_data, aes(x = Sparsity, y = Mean_Jaccard)) +
+  geom_line(color = "#1f77b4", size = 1) +  # 绘制平均 Jaccard 系数的折线
+  geom_ribbon(aes(ymin = Mean_Jaccard - SD_Jaccard, ymax = Mean_Jaccard + SD_Jaccard), 
+              fill = "lightblue", alpha = 0.3) +  # 添加标准差作为置信带
+  scale_x_continuous(limits = c(0.01, 0.50), breaks = seq(0.0, 0.50, by = 0.1)) +  # 设置 X 轴范围和刻度
+  scale_y_continuous(limits = c(0.3, 0.73), breaks = seq(0, 1, by = 0.1)) +  # 设置 Y 轴范围和刻度
+  labs(title = "Mean Jaccard Similarity Across Subjects",
+       x = "Sparsity Level",
+       y = "Jaccard Similarity") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 19, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 16,face = "bold")
+  )
+p_global
+# Save figure 5E
+# ggsave(file.path(fig_dir, "Figure5E_Mean_Jaccard_Curve.png"),
+#        p_global, width = 6, height = 6, dpi = 300)
+```
+
+## Network-wise Jaccard: intra vs inter
+
+```{r}
+# Load AAL 7-network assignment for 90 GM regions (values 1..7)
+net_index <- readr::read_csv(net_index_path, col_names = FALSE) |>
+  as.matrix() |> as.vector()
+stopifnot(length(net_index) == n_regions)
+net_labels <- c("VN", "SMN", "AN", "LB", "FPN", "DMN", "BGN")
+
+# Jaccard on a block (vectorized logicals)
+jaccard_block <- function(A, B) {
+  a <- as.vector(A)
+  b <- as.vector(B)
+  inter <- sum(a & b)
+  uni   <- sum(a | b)
+  if (uni == 0) return(NA_real_)
+  inter / uni
+}
+
+results_long <- tibble(
+  Subject  = integer(),
+  Sparsity = numeric(),
+  Network  = character(),
+  JaccardIntra = numeric(),
+  JaccardInter = numeric()
+)
+
+for (sp in sparsity_grid) {
+  for (s in seq_len(n_subject)) {
+    A1 <- binarize_topk(GM_GM[,,s],   sp)
+    A2 <- binarize_topk(GWM_HFN[,,s], sp)
+
+    intra_vals <- numeric(length(net_labels))
+    inter_vals <- numeric(length(net_labels))
+
+    for (net in seq_along(net_labels)) {
+      idx_net <- which(net_index == net)
+
+      # Intra-network: use lower-triangle within the block
+      B1_intra <- A1[idx_net, idx_net, drop = FALSE]
+      B2_intra <- A2[idx_net, idx_net, drop = FALSE]
+      lt <- lower.tri(B1_intra, diag = FALSE)
+      intra_vals[net] <- jaccard_block(B1_intra[lt, drop = FALSE], B2_intra[lt, drop = FALSE])
+
+      # Inter-network: current network vs all other nodes
+      idx_other <- setdiff(seq_len(n_regions), idx_net)
+      B1_inter <- A1[idx_net, idx_other, drop = FALSE]
+      B2_inter <- A2[idx_net, idx_other, drop = FALSE]
+      inter_vals[net] <- jaccard_block(B1_inter, B2_inter)
+    }
+
+    results_long <- bind_rows(
+      results_long,
+      tibble(
+        Subject  = s,
+        Sparsity = sp,
+        Network  = net_labels,
+        JaccardIntra = intra_vals,
+        JaccardInter = inter_vals
+      )
+    )
+  }
+}
+
+# Summaries across subjects
+summary_results <- results_long |>
+  group_by(Sparsity, Network) |>
+  summarise(
+    MeanJaccardIntra = mean(JaccardIntra, na.rm = TRUE),
+    SDJaccardIntra   = sd(JaccardIntra, na.rm = TRUE),
+    MeanJaccardInter = mean(JaccardInter, na.rm = TRUE),
+    SDJaccardInter   = sd(JaccardInter, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(Network = factor(Network, levels = net_labels))
+
+# Save SourceData sheets for Figure 5F and 5G
+summary_intra <- summary_results |>
+  select(Sparsity, Network, MeanJaccardIntra, SDJaccardIntra) |>
+  arrange(Sparsity, Network)
+summary_inter <- summary_results |>
+  select(Sparsity, Network, MeanJaccardInter, SDJaccardInter) |>
+  arrange(Sparsity, Network)
+
+# save_sheet(wb, "FigureS1_IntraNetwork_Jac", summary_intra)
+# save_sheet(wb, "FigureS2_InterNetwork_Jac", summary_inter)
+
+# Color map for networks
+color_map <- c(
+  rgb(186,  85, 211, maxColorValue = 255),  # VN
+  rgb( 70, 130, 180, maxColorValue = 255),  # SMN
+  rgb(144, 238, 144, maxColorValue = 255),  # AN
+  rgb(200,   0,   0, maxColorValue = 255),  # LB
+  rgb(255, 140,   0, maxColorValue = 255),  # FPN
+  rgb(255, 182, 193, maxColorValue = 255),  # DMN
+  rgb(139,  69,  19, maxColorValue = 255)   # BGN
+)
+
+p_intra <- ggplot(summary_results, aes(x = Sparsity, y = MeanJaccardIntra, color = Network)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = color_map) +
+  labs(title = "Intra-Network Jaccard Similarity",
+       x = "Sparsity",
+       y = "Mean Jaccard") +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_inter <- ggplot(summary_results, aes(x = Sparsity, y = MeanJaccardInter, color = Network)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = color_map) +
+  labs(title = "Inter-Network Jaccard Similarity",
+       x = "Sparsity",
+       y = "Mean Jaccard") +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_combo <- p_intra + p_inter + plot_layout(ncol = 2, guides = "collect")
+p_combo
+# Save figure (Figure 5F/5G combined)
+# ggsave(file.path(fig_dir, "FigureS1_Network_Jaccard.png"),
+       # p_combo, width = 12, height = 5.5, dpi = 300)
+```
+
+## Save SourceData workbook
+
+```{r}
+saveWorkbook(wb, excel_file, overwrite = TRUE)
+message("SourceData saved to: ", excel_file)
+message("Figures saved to: ", fig_dir)
+```

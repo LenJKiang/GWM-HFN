@@ -1,0 +1,573 @@
+---
+title: "Mueller-style inter-subject variability on SLIM (2 sessions): GM–GM vs GWM-HFN"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+editor: visual
+params:
+  # Base directory containing SLIM .mat matrices
+  slim_dir: "E:/Neuroimage/MyProject/GMWM_Network/Data/SLIM"
+  gm_t1_file: "GMGM_time1_common.mat"
+  gm_t2_file: "GMGM_time2_common.mat"
+  gw_t1_file: "GWM_HFN_time1_common.mat"
+  gw_t2_file: "GWM_HFN_time2_common.mat"
+
+  # AAL90 node info for annotation (must contain 'ID' and preferably 'Label'; include X/Y/Z if you want brain plots)
+  aal_node_info_csv: "E:/Neuroimage/MyProject/GMWM_Network/Data/aal_node_info.csv"
+  # AAL90 → Yeo-7 mapping (single column with 90 integers in 1..7)
+  network_index_csv: "E:/Neuroimage/MyProject/GMWM_Network/Data/AAL_7networkIndex.csv"
+
+  # Where to save all outputs (figures and tables)
+  output_dir: "E:/Neuroimage/MyProject/GMWM_Network/Code_R1/step3_compare_GMGM/Results_Mueller_SLIM"
+
+  # Analysis options
+  fisher_z_for_gmgm: true          # Fisher z-transform GM–GM edges before computing profile correlations
+  zscore_profiles: true            # z-score node-wise profiles before subject-by-subject correlation
+  similarity_method: "pearson"     # "pearson" or "spearman"
+  do_spearman_sensitivity: false   # optionally recompute using Spearman similarities
+  seed: 20250810
+---
+
+# 0) Setup
+
+```{r}
+pkgs <- c(
+  "tidyverse","broom","sandwich","lmtest","patchwork",
+  "hdf5r","R.matlab","stringr","ggrepel","emmeans","ggpubr","readr",
+  "plotly","htmlwidgets","viridis","scales"
+)
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(params$seed)
+
+out_dir <- params$output_dir
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", normalizePath(out_dir), "\n")
+```
+
+# 1) Load SLIM data (2 sessions; robust to both new and legacy filenames)
+
+This chunk reads 90×90×N arrays for GM–GM and GWM-HFN from MATLAB .mat files. 
+
+```{r}
+sdir <- params$slim_dir
+stopifnot(dir.exists(sdir))
+
+gm_t1 <- file.path(sdir, params$gm_t1_file)
+gm_t2 <- file.path(sdir, params$gm_t2_file)
+gw_t1 <- file.path(sdir, params$gw_t1_file)
+gw_t2 <- file.path(sdir, params$gw_t2_file)
+
+# Helper: read a single named variable from a v6 MAT file and ensure it is 90x90xN
+read_mat_var <- function(path, varname) {
+  stopifnot(file.exists(path))
+  lst <- R.matlab::readMat(path)
+  if (!varname %in% names(lst)) {
+    stop(sprintf("Variable '%s' not found in %s. Available: %s",
+                 varname, basename(path), paste(names(lst), collapse = ", ")))
+  }
+  arr <- lst[[varname]]
+  # If stored as 2D (single subject), promote to 3D with trailing singleton
+  if (length(dim(arr)) == 2L) arr <- array(arr, dim = c(dim(arr), 1L))
+  stopifnot(length(dim(arr)) == 3L,
+            dim(arr)[1] == 90L, dim(arr)[2] == 90L)
+  arr
+}
+
+# Read matrices (expect variables: time1_GMGM, time2_GMGM, time1_GWM_HFN, time2_GWM_HFN)
+if (!file.exists(gm_t1)) stop("GM T1 file not found: ", gm_t1)
+if (!file.exists(gm_t2)) stop("GM T2 file not found: ", gm_t2)
+if (!file.exists(gw_t1)) stop("GWM T1 file not found: ", gw_t1)
+if (!file.exists(gw_t2)) stop("GWM T2 file not found: ", gw_t2)
+
+GM_T1 <- read_mat_var(gm_t1, "time1.GMGM.common")
+GM_T2 <- read_mat_var(gm_t2, "time2.GMGM.common")
+GW_T1 <- read_mat_var(gw_t1, "time1.GWM.HFN.common")
+GW_T2 <- read_mat_var(gw_t2, "time2.GWM.HFN.common")
+
+stopifnot(all(dim(GM_T1) == dim(GM_T2)), all(dim(GW_T1) == dim(GW_T2)))
+
+cat("GM-GM dims (T1):", paste(dim(GM_T1), collapse = " x "), "\n")
+cat("GWM-HFN dims (T1):", paste(dim(GW_T1), collapse = " x "), "\n")
+```
+
+# 2) Compute Mueller-style variability (2 sessions)
+
+-   Within-subject dissimilarity per node: N_i = mean_s \[1 − r12\], where r12 is the correlation of node i’s profiles between session 1 and 2 for subject s
+-   Between-subject similarity per node and session: R_i(t) = mean lower-triangle of subject-by-subject correlation
+-   Observed inter-subject variability: Y_i(t) = 1 − R_i(t); session-averaged Ȳ\_i = mean_t Y_i(t)
+-   Residual (N-adjusted) variability: residuals of lm(Ȳ\_i \~ centered N_i)
+
+```{r}
+mean_lower_tri <- function(mat) mean(mat[lower.tri(mat)], na.rm = TRUE)
+
+fisher_z <- function(x) {
+  x <- pmin(pmax(x, -0.999999), 0.999999)
+  0.5 * log((1 + x) / (1 - x))
+}
+
+calculate_variability_mueller_2s <- function(t1_data, t2_data,
+                                             fisher_z_fc = FALSE,
+                                             zscore_profiles = TRUE,
+                                             similarity_method = c("pearson","spearman")) {
+  similarity_method <- match.arg(similarity_method)
+  stopifnot(length(dim(t1_data)) == 3, length(dim(t2_data)) == 3)
+  nroi <- dim(t1_data)[1]; nsub <- dim(t1_data)[3]
+  stopifnot(dim(t1_data)[1] == dim(t1_data)[2], all(dim(t1_data) == dim(t2_data)))
+
+  if (fisher_z_fc) {
+    t1_data <- apply(t1_data, 3, fisher_z) |> array(dim = dim(t1_data))
+    t2_data <- apply(t2_data, 3, fisher_z) |> array(dim = dim(t2_data))
+  }
+
+  # Subject-by-subject correlation for node i within a session
+  sub_corr_for_node <- function(data3d, i) {
+    prof <- matrix(NA_real_, nrow = nsub, ncol = nroi - 1)
+    for (s in seq_len(nsub)) {
+      v <- data3d[i, -i, s]
+      if (zscore_profiles) v <- as.numeric(scale(v))
+      prof[s, ] <- v
+    }
+    suppressWarnings(cor(t(prof), use = "pairwise.complete.obs", method = similarity_method))
+  }
+
+  # 1) N_i using T1–T2 correlation of profiles per subject
+  N <- numeric(nroi)
+  for (i in seq_len(nroi)) {
+    r12 <- numeric(nsub)
+    for (s in seq_len(nsub)) {
+      v1 <- t1_data[i, -i, s]
+      v2 <- t2_data[i, -i, s]
+      if (zscore_profiles) { v1 <- as.numeric(scale(v1)); v2 <- as.numeric(scale(v2)) }
+      r12[s] <- suppressWarnings(cor(v1, v2, use = "pairwise.complete.obs", method = similarity_method))
+    }
+    N[i] <- mean(1 - r12, na.rm = TRUE)
+  }
+
+  # 2) R_i(t)
+  R_t1 <- numeric(nroi); R_t2 <- numeric(nroi)
+  for (i in seq_len(nroi)) {
+    R_t1[i] <- mean_lower_tri(sub_corr_for_node(t1_data, i))
+    R_t2[i] <- mean_lower_tri(sub_corr_for_node(t2_data, i))
+  }
+
+  # 3) Ȳ and residuals
+  Y1 <- 1 - R_t1; Y2 <- 1 - R_t2
+  Y  <- (Y1 + Y2) / 2
+
+  Xc <- as.numeric(scale(N, center = TRUE, scale = FALSE))
+  fit <- lm(Y ~ Xc)
+  resid_Y <- resid(fit)
+
+  list(N = N, Y = Y, resid = resid_Y, fit = fit, Y_by_session = cbind(Y1, Y2))
+}
+
+# Run the pipeline for both methods
+res_gmgm <- calculate_variability_mueller_2s(
+  GM_T1, GM_T2,
+  fisher_z_fc = isTRUE(params$fisher_z_for_gmgm),
+  zscore_profiles = isTRUE(params$zscore_profiles),
+  similarity_method = params$similarity_method
+)
+
+res_gwm  <- calculate_variability_mueller_2s(
+  GW_T1, GW_T2,
+  fisher_z_fc = FALSE,
+  zscore_profiles = isTRUE(params$zscore_profiles),
+  similarity_method = params$similarity_method
+)
+res_gmgm$Y %>% mean();res_gmgm$Y %>% sd()
+
+res_gwm$Y %>% mean();res_gwm$Y %>% sd()
+
+
+res_gmgm$N %>% mean();res_gmgm$N %>% sd()
+
+res_gwm$N %>% mean();res_gwm$N %>% sd()
+
+cor.test(res_gmgm$Y,res_gwm$Y)
+cor.test(res_gmgm$N,res_gwm$N)
+
+```
+
+# 3) ANCOVA: Ȳ \~ N + Method (node-level)
+
+Test whether two methods differ at a common N level.
+
+```{r}
+n_node <- length(res_gmgm$Y)
+df <- tibble(
+  Node   = rep(1:n_node, times = 2),
+  Method = factor(rep(c("GM-GM","GWM-HFN"), each = n_node), levels = c("GM-GM","GWM-HFN")),
+  N      = c(as.numeric(res_gmgm$N),  as.numeric(res_gwm$N)),
+  Y      = c(as.numeric(res_gmgm$Y),  as.numeric(res_gwm$Y))
+) %>% mutate(Nc = as.numeric(scale(N, center = TRUE, scale = FALSE)))
+
+fit_main <- lm(Y ~ Nc + Method, data = df)
+cat("ANCOVA (Y ~ Nc + Method)\n")
+print(summary(fit_main))
+
+# Robust HC3 SE (optional)
+rob <- lmtest::coeftest(fit_main, vcov = sandwich::vcovHC(fit_main, type = "HC3"))
+cat("\nRobust (HC3) coefficients:\n")
+print(rob)
+
+broom::tidy(fit_main) %>% write_csv(file.path(out_dir, "SLIM_ANCOVA_Y_on_N_Method.csv"))
+```
+
+## 3.1) Diagnostics: Y–N relationship and interaction
+
+```{r}
+# Separate regressions
+fit_gm <- lm(Y ~ N, data = df %>% filter(Method == "GM-GM"))
+fit_gw <- lm(Y ~ N, data = df %>% filter(Method == "GWM-HFN"))
+cat("\n--- GM-GM: Y ~ N ---\n"); print(summary(fit_gm))
+cat("\n--- GWM-HFN: Y ~ N ---\n"); print(summary(fit_gw))
+
+# Scatter with regression lines
+p_YN <- ggplot(df, aes(N, Y, color = Method)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "SLIM: Node-wise Y vs N by Method",
+       x = "N (within-subject dissimilarity)", y = "Y (1 − R, between-subject variability)") +
+  theme_classic(base_size = 14)
+print(p_YN)
+ggsave(file.path(out_dir, "SLIM_Diag_Y_vs_N_by_Method.png"), p_YN, width = 7.5, height = 5.2, dpi = 300)
+
+# Interaction model (optional)
+fit_int <- lm(Y ~ Nc * Method, data = df)
+cat("\n--- ANCOVA with interaction: Y ~ Nc * Method ---\n")
+print(anova(fit_int))
+print(summary(fit_int))
+
+broom::tidy(fit_gm)   %>% write_csv(file.path(out_dir, "SLIM_Diag_fit_gmgm_Y_on_N.csv"))
+broom::tidy(fit_gw)   %>% write_csv(file.path(out_dir, "SLIM_Diag_fit_gwmhfn_Y_on_N.csv"))
+broom::tidy(fit_int)  %>% write_csv(file.path(out_dir, "SLIM_Diag_fit_interaction_Y_on_Nc_Method.csv"))
+```
+
+## 3.2) Robustness: N-binned comparisons
+
+```{r}
+df_with_bins <- df %>% mutate(N_bin = factor(ntile(N, 10), levels = 1:10, labels = paste0("Q", 1:10)))
+
+df_bins <- df_with_bins %>%
+  group_by(N_bin, Method) %>%
+  summarise(mean_Y = mean(Y, na.rm = TRUE), .groups = "drop")
+print(df_bins)
+
+diff_by_bin <- df_with_bins %>%
+  group_by(N_bin) %>%
+  summarise(
+    p_t = tryCatch(t.test(Y ~ Method)$p.value, error = function(e) NA_real_),
+    diff = tryCatch(diff(tapply(Y, Method, mean, na.rm = TRUE)), error = function(e) NA_real_),
+    .groups = "drop"
+  )
+print(diff_by_bin)
+
+p_bins <- ggplot(df_bins, aes(x = N_bin, y = mean_Y, fill = Method)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  labs(title = "Mean Y within N-decile bins", x = "N decile", y = "Mean Y") +
+  theme_classic(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  scale_fill_manual(values = c("GM-GM" = "#3182bd", "GWM-HFN" = "#e6550d"))
+print(p_bins)
+ggsave(file.path(out_dir, "SLIM_Diag_Y_by_N_decile_and_Method.png"), p_bins, width = 9.5, height = 5.2, dpi = 300)
+
+write_csv(df_bins,     file.path(out_dir, "SLIM_Diag_Y_means_by_N_decile_and_Method.csv"))
+write_csv(diff_by_bin, file.path(out_dir, "SLIM_Diag_Y_method_difference_by_N_decile.csv"))
+```
+
+# 4) N-adjusted residual maps and pattern comparison
+
+```{r}
+var_gmgm <- res_gmgm$resid
+var_gwm  <- res_gwm$resid
+
+# Correlation across nodes
+cor_res <- cor.test(var_gmgm, var_gwm, method = "pearson")
+
+# Paired non-parametric test across nodes
+wilc <- wilcox.test(var_gwm, var_gmgm, paired = TRUE, exact = FALSE)
+
+cat(sprintf("Residual-map correlation: r = %.3f (95%% CI [%0.3f, %0.3f]), p = %.2g\n",
+            cor_res$estimate, cor_res$conf.int[1], cor_res$conf.int[2], cor_res$p.value))
+cat(sprintf("Wilcoxon signed-rank (GWM-HFN > GM-GM): V = %.0f, p = %.2g\n",
+            wilc$statistic, wilc$p.value))
+
+# Scatter + violin
+#-----(1) Scatter----
+scatter_df <- tibble(Node = 1:n_node, GMGM = var_gmgm, GWMHFN = var_gwm)
+
+net_idx_raw <- read_csv(params$network_index_csv, col_names = FALSE, show_col_types = FALSE)
+
+net_idx <- as.integer(unlist(net_idx_raw))
+stopifnot(length(net_idx) == n_node)
+
+# 2) Define network labels (check the 4th label: LB vs LN)
+network_labels <- c("VN","SMN","AN","LB","FPN","DMN","BGN")
+
+Network <- factor(network_labels[net_idx], levels = network_labels)
+
+# 3) Bind network info to scatter_df
+scatter_df <- scatter_df %>%
+  dplyr::mutate(Network = Network)
+
+vals_all <- c(scatter_df$GMGM, scatter_df$GWMHFN)
+rng_raw  <- range(vals_all, na.rm = TRUE, finite = TRUE)
+pad_frac <- 0.02
+pad_val  <- diff(rng_raw) * pad_frac
+rng <- c(rng_raw[1] - pad_val, rng_raw[2] + pad_val)
+
+# 4) Define your custom RGB colors (converted to hex)
+net_colors <- c(
+  "VN"  = "#BA55D3",  # 186,85,211
+  "SMN" = "#4682B4",  # 70,130,180
+  "AN"  = "#90EE90",  # 144,238,144
+  "LB"  = "#C80000",  # 200,0,0   (改成 "LN" 对应上面标签时，也在此键名同步改)
+  "FPN" = "#FF8C00",  # 255,140,0
+  "DMN" = "#FFB6C1",  # 255,182,193
+  "BGN" = "#8B4513"   # 139,69,19
+)
+
+# 5) Rebuild the residual scatter plot with network coloring
+p_scatter <- ggplot(scatter_df, aes(x = GMGM, y = GWMHFN, color = Network)) +
+  geom_point(alpha = 0.88, size = 5, stroke = 0) +
+  geom_smooth(method = "lm", se = TRUE, color = "red",
+              linetype = "solid", linewidth = 1.0,
+              inherit.aes = FALSE, aes(x = GMGM, y = GWMHFN)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "gray40", linewidth = 0.9)+
+  scale_color_manual(values = net_colors, name = "Network") +
+  annotate("text",
+           x = rng[1],
+           y = rng[2],
+           hjust = 0, vjust = 1,
+           label = sprintf("r = %.3f \np = %.2g", cor_res$estimate, cor_res$p.value),
+           size = 9, fontface = "bold") +
+  scale_x_continuous(limits = rng) +
+  scale_y_continuous(limits = rng) +
+  labs(
+    title = "Node-wise N-adjusted variability",
+    x = "GM–GM residual variability",
+    y = "GWM-HFN residual variability"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title      = element_text(size = 23, face = "bold"),
+    axis.title.x    = element_text(size = 22, face = "bold"),
+    axis.title.y    = element_text(size = 22, face = "bold"),
+    axis.text       = element_text(size = 15, face = "bold"),
+    legend.title    = element_text(size = 16, face = "bold"),
+    legend.text     = element_text(size = 14, face = "bold"),
+    legend.background = element_rect(color = "black", fill = "white", linewidth = 0.6),
+    legend.key = element_rect(color = "black", fill = "white"),
+    legend.position = c(0.9,0.23)
+  ) +
+  coord_equal()
+  
+
+print(p_scatter)
+
+# ggsave(file.path(out_dir, "SLIM_Scatter_residual_variability_byNetwork.png"),
+#        p_scatter, width = 7, height = 7, dpi = 300)
+
+
+#-----(2) violin----
+
+violin_df <- tibble(
+  Node = rep(1:n_node, 2),
+  Method = factor(rep(c("GM-GM","GWM-HFN"), each = n_node), levels = c("GM-GM","GWM-HFN")),
+  Variability = c(var_gmgm, var_gwm)
+)
+
+y_range  <- range(violin_df$Variability, na.rm = TRUE)
+y_span   <- diff(y_range)
+y_bar    <- y_range[2] + 0.03 * y_span   # 横杠位置
+y_text   <- y_range[2] + 0.065 * y_span  # “N.S.”文字位置
+
+p_violin <- ggplot(violin_df, aes(Method, Variability, fill = Method)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.85) +
+  scale_fill_manual(values = c("GM-GM" = "#3182bd", "GWM-HFN" = "#e6550d")) +
+  labs(title = "Distribution of N-adjusted variability",
+       x = "", y = "Residual variability") +
+  geom_segment(aes(x = 1, xend = 2, y = y_bar, yend = y_bar),
+               inherit.aes = FALSE, linewidth = 0.8) +
+  annotate("text", x = 1.5, y = y_text, label = "N.S.",
+           fontface = "bold", size = 7) +
+  expand_limits(y = y_text + 0.03 * y_span) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title      = element_text(size = 23, face = "bold"),
+    axis.title.x    = element_text(size = 22, face = "bold"),
+    axis.title.y    = element_text(size = 22, face = "bold"),
+    axis.text       = element_text(size = 19, face = "bold"),
+    legend.position = "none") 
+
+p_violin
+# ggsave(file.path(out_dir, "SLIM_Violin_residual_variability.png"), width = 7, height = 7, dpi = 300)
+
+# Save node-wise vectors
+write_csv(tibble(Node = 1:n_node,
+                 N_GMGM = res_gmgm$N, N_GWMHFN = res_gwm$N,
+                 Y_GMGM = res_gmgm$Y, Y_GWMHFN = res_gwm$Y,
+                 Resid_GMGM = var_gmgm, Resid_GWMHFN = var_gwm),
+          file.path(out_dir, "SLIM_Nodewise_Variability_and_Residuals.csv"))
+```
+
+## 4.1) Top-20% nodes, overlap, and AAL annotation (BrainNet-free)
+
+```{r}
+k_prop <- 0.20
+k <- max(1, round(n_node * k_prop)) # 18
+
+ord_gmgm <- order(var_gmgm, decreasing = TRUE)[1:k]
+ord_gwm  <- order(var_gwm,  decreasing = TRUE)[1:k]
+
+top_gmgm <- tibble(Node = ord_gmgm, Residual = var_gmgm[ord_gmgm], Method = "GM-GM")
+top_gwm  <- tibble(Node = ord_gwm,  Residual = var_gwm[ord_gwm],  Method = "GWM-HFN")
+intersect(top_gmgm$Node,top_gwm$Node) #4
+
+dice <- function(A, B) 2 * length(intersect(A,B)) / (length(A) + length(B))
+jaccard <- function(A, B) length(intersect(A,B)) / length(union(A,B))
+
+D <- dice(top_gmgm$Node, top_gwm$Node)
+J <- jaccard(top_gmgm$Node, top_gwm$Node)
+cat(sprintf("Top-%.0f%% node overlap: Dice = %.3f, Jaccard = %.3f\n", k_prop*100, D, J))
+# Top-20% node overlap: Dice = 0.222, Jaccard = 0.125
+
+aal_info <- read_csv(params$aal_node_info_csv, show_col_types = FALSE)
+names(aal_info) <- gsub("\\s+","_",names(aal_info))
+if (!"Node_Index" %in% names(aal_info)) stop("aal_node_info.csv must contain column 'Node_Index' with 1..90")
+if (!"RegionName" %in% names(aal_info)) {
+  lblcol <- names(aal_info)[grepl("label|name|region", names(aal_info), ignore.case = TRUE)][1]
+  if (!is.na(lblcol)) names(aal_info)[names(aal_info)==lblcol] <- "Label" else aal_info$Label <- paste0("ROI_", aal_info$ID)
+}
+annotate_nodes <- function(tbl) tbl %>% left_join(aal_info, by = c("Node" = "Node_Index")) %>% arrange(desc(Residual))
+top_gmgm_annot <- annotate_nodes(top_gmgm)
+top_gwm_annot  <- annotate_nodes(top_gwm)
+overlap_nodes  <- intersect(top_gmgm$Node, top_gwm$Node)
+overlap_annot  <- aal_info %>% filter(Node_Index %in% overlap_nodes) %>% arrange(Node_Index)
+
+write_csv(top_gmgm_annot, file.path(out_dir, sprintf("Top%02d_GMGM_nodes.csv", round(k_prop*100))))
+write_csv(top_gwm_annot,  file.path(out_dir, sprintf("Top%02d_GWMHFN_nodes.csv", round(k_prop*100))))
+write_csv(overlap_annot,  file.path(out_dir, sprintf("Top%02d_overlap_nodes.csv", round(k_prop*100))))
+```
+
+## 4.2) Export BrainNet Viewer .node files (AAL coordinates; no BrainNet needed in R)
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(scales)
+})
+
+# 0) Inputs expected from earlier sections:
+# - var_gmgm, var_gwm: length-90 vectors of N-adjusted residual variability (node-wise)
+# - params$aal_node_info_csv: CSV with columns:
+#     Node_Index (1..90), RegionName, and MNI coordinates X/Y/Z (any case)
+#   Example headers: Node_Index, RegionName, X, Y, Z
+#   If your coordinate columns have different names, they will be auto-detected.
+
+# 1) Load AAL node info
+aal <- read_csv(params$aal_node_info_csv, show_col_types = FALSE)
+names(aal) <- gsub("\\s+","_", names(aal))
+
+xcol <- "Coord_X"
+ycol <- "Coord_Y"
+zcol <- "Coord_Z"
+
+aal_coords <- aal %>%
+  transmute(
+    Node_Index = as.integer(Node_Index),
+    Label = RegionName,
+    X = .data[[xcol]], Y = .data[[ycol]], Z = .data[[zcol]],
+    Network = Network
+  ) %>%
+  arrange(Node_Index)
+
+aal_coords <- aal_coords %>%
+  mutate(
+    Module_Factor = factor(Network,levels = c("VN","SMN","AN","LN","FPN","DMN","BGN")),            
+    Module_ID     = as.integer(Module_Factor)   # strictly numeric
+  )
+
+
+# 2) Build node tables for BrainNet Viewer
+# BrainNet .node columns: x y z color size label
+# - We encode:
+#     color = signed residual (you can set colorbar min/max symmetrically around 0 in BrainNet)
+#     size  = |residual| rescaled to [1, 8] (adjust below if desired)
+# - We export two versions per method:
+#     a) Full map: size ~ |residual|, color ~ residual
+#     b) Top-k% only: top nodes have size_on (e.g., 5), others size_off (e.g., 0)
+
+build_node_df <- function(residual_vec, coords_df, size_range = c(1, 8)) {
+  df <- coords_df %>%
+    mutate(
+      Residual = residual_vec[Node_Index],
+      Color = Module_ID,
+      Size  = if (diff(range(abs(Residual), na.rm = TRUE)) == 0) {
+        # if all magnitudes are identical, use a constant size
+        rep(mean(size_range), 90)
+      } else {
+        scales::rescale(abs(Residual), to = size_range, from = range(abs(Residual), na.rm = TRUE))
+      }
+    )
+  # Order strictly by Node_Index for BrainNet
+  df %>% arrange(Node_Index) %>%
+    transmute(X, Y, Z, Color, Size, Label)
+}
+
+write_node_file <- function(node_df, out_file) {
+  # Write as tab-delimited without header
+  write.table(node_df, file = out_file, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE, fileEncoding = "UTF-8")
+  message("Saved: ", normalizePath(out_file))
+}
+
+# a) Full residual maps
+node_gmgm_full  <- build_node_df(var_gmgm, aal_coords, size_range = c(1, 8))
+node_gwmhfn_full <- build_node_df(var_gwm,  aal_coords, size_range = c(1, 8))
+
+write_node_file(node_gmgm_full,  file.path(out_dir, "BNV_AAL90_Residual_GMGM.node"))
+write_node_file(node_gwmhfn_full, file.path(out_dir, "BNV_AAL90_Residual_GWMHFN.node"))
+
+# b) Top-k% only (binary size map; edit k_prop and sizes as needed)
+k_prop <- 0.20
+k <- max(1, round(90 * k_prop))
+top_idx_gmgm <- order(var_gmgm, decreasing = TRUE)[1:k]
+top_idx_gwm  <- order(var_gwm,  decreasing = TRUE)[1:k]
+
+make_top_node <- function(residual_vec, coords_df, top_idx, size_on = 5, size_off = 0) {
+  df <- coords_df %>%
+    mutate(
+      Residual = residual_vec[Node_Index],
+      Color = Module_ID,                 # keep signed color for reference
+      Size  = ifelse(Node_Index %in% top_idx, size_on, size_off)
+    ) %>%
+    arrange(Node_Index) %>%
+    transmute(X, Y, Z, Color, Size, Label)
+  df
+}
+
+node_gmgm_top <- make_top_node(var_gmgm, aal_coords, top_idx_gmgm, size_on = 5, size_off = 0)
+node_gwm_top  <- make_top_node(var_gwm,  aal_coords, top_idx_gwm,  size_on = 5, size_off = 0)
+
+write_node_file(node_gmgm_top, file.path(out_dir, sprintf("BNV_AAL90_Top%02d_GMGM.node", round(k_prop*100))))
+write_node_file(node_gwm_top,  file.path(out_dir, sprintf("BNV_AAL90_Top%02d_GWMHFN.node", round(k_prop*100))))
+
+# Notes for BrainNet Viewer:
+# - Load one of the .node files; set a diverging colormap and colorbar limits symmetric around 0
+#   to reflect the sign of residuals in the 'Color' column.
+# - Node 'Size' encodes |residual| (full maps) or a binary Top-% marker (top-only maps).
+# - Labels use your RegionName column; ensure BrainNet uses UTF-8 if names include non-ASCII characters.
+```

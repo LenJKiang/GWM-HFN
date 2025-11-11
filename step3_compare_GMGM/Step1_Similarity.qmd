@@ -1,0 +1,305 @@
+---
+title: "Comparison of GM-WM-GM vs GM-GM Networks: Similarity Analysis"
+---
+
+## Data Import and Preparation
+
+```{r}
+library(tidyverse)
+library(R.matlab)
+rm(list=ls())
+
+# Set data path
+data_path <- "E:/Neuroimage/MyProject/GMWM_Network/Data/SLIM/"
+
+# Load GM-GM connectivity matrices (subjects × 90 × 90)
+gm_file <- readMat(file.path(data_path, "GMGM_time1.mat"))
+GM_GM <- gm_file$time1.GMGM
+
+# Load GM-WM-GM connectivity matrices (subjects × 90 × 90)
+gwm_file <- readMat(file.path(data_path, "GWM_HFN_time1.mat"))
+GWM_HFN <- gwm_file$time1.GWM.HFN
+rm(list = setdiff(ls(), c("GM_GM", "GWM_HFN")))
+```
+
+## Edge-wise Correlation Analysis
+
+```{r}
+# Calculate edge-wise correlation between GM-GM and GM-WM-GM networks across subjects
+indices <- expand.grid(i = 1:90, j = 1:90)
+correlation_matrix <- matrix(
+  map2_dbl(
+    indices$i, 
+    indices$j,
+    ~cor(GM_GM[.x, .y, ], GWM_HFN[.x, .y, ])  # Correlation for each edge
+  ),
+  nrow = 90,
+  ncol = 90
+)
+
+# Summary statistics
+mean_correlation <- mean(correlation_matrix, na.rm = TRUE)
+sd_correlation <- sd(correlation_matrix, na.rm = TRUE)
+max_correlation <- max(correlation_matrix, na.rm = TRUE)
+min_correlation <- min(correlation_matrix, na.rm = TRUE)
+
+print(sprintf("Mean edge-wise correlation: %.3f (SD: %.3f), range [%.3f, %.3f]", 
+              mean_correlation, sd_correlation, min_correlation, max_correlation))
+# Mean edge-wise correlation: 0.773 (SD: 0.038), range [0.616, 0.912]
+
+# Histogram of edge-wise correlations
+hist(
+  correlation_matrix, breaks = 20, 
+  main = "GM-GM vs GM-WM-GM Edge-wise Correlation Coefficients", 
+  xlab = "Correlation Coefficient", ylab = "Frequency", 
+  col = "lightblue", border = "black"
+)
+```
+
+## Example Subject: Scatter Plot of Connectivity Patterns
+
+```{r}
+set.seed(1)  # For reproducibility
+subject_idx <- sample(1:dim(GM_GM)[3], 1)  # Randomly select a subject
+
+# Extract lower triangle (excluding diagonal) for the subject
+lower_tri_indices <- which(lower.tri(GM_GM[,,1], diag = FALSE), arr.ind = TRUE)
+subject_data <- data.frame(
+  GM_GM = GM_GM[cbind(lower_tri_indices[,1], lower_tri_indices[,2], rep(subject_idx, nrow(lower_tri_indices)))],
+  GWM_HFN = GWM_HFN[cbind(lower_tri_indices[,1], lower_tri_indices[,2], rep(subject_idx, nrow(lower_tri_indices)))]
+)
+
+# Z-score normalization
+subject_data$GM_GM <- scale(subject_data$GM_GM)
+subject_data$GWM_HFN <- scale(subject_data$GWM_HFN)
+
+edge_correlation <- cor.test(subject_data$GM_GM, subject_data$GWM_HFN)$estimate[1]
+print(sprintf("Edge-wise correlation for subject %d: %.3f", subject_idx, edge_correlation))
+
+# Scatter plot
+library(ggpointdensity)
+p <- ggplot(subject_data, aes(x = GM_GM, y = GWM_HFN)) +
+  geom_text(aes(label = paste0("r = ", round(edge_correlation, 3))), 
+            x = -3, y = 2, size = 10, color = "black") +
+  geom_pointdensity(size = 3) +
+  scale_colour_gradient2(name = 'Counts',
+                         low = "#4292C6",
+                         high = "#F16913",
+                         mid = '#FFF7BC',
+                         midpoint = 250,
+                         limits = c(1,505)) +
+  geom_smooth(method = 'lm', color = "red") +
+  coord_fixed() +
+  labs(
+    title = paste("Example: Subject", subject_idx),
+    x = "GM-GM Connectivity (Z-score)",
+    y = "GWM-HFN Connectivity (Z-score)"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 28, face = "bold"),
+    axis.text = element_text(size = 22, face = "bold"),
+    axis.title = element_text(size = 25, face = "bold"),
+    legend.position = c(0.99,0.01),
+    legend.justification = c(1,0),
+    legend.background = element_rect(colour = 'black'),
+    legend.title = element_text(size = 18, face = 'bold'),
+    legend.text  = element_text(size = 16)
+  )
+print(p)
+# ggsave("../visualization/Figure5_CompareGMGM/Scatter_Plot_of_Example_GWM_GM.png", 
+#        p, width = 8, height = 8, dpi = 300)
+
+```
+
+## Save High and Low Correlation Edges as .mat Files
+
+```{r}
+# Prepare correlation matrix for saving
+correlation_matrix_cleaned <- correlation_matrix
+diag(correlation_matrix_cleaned) <- NA
+
+# Extract lower triangle values
+lower_triangle_indices <- lower.tri(correlation_matrix_cleaned)
+correlation_values <- correlation_matrix_cleaned[lower_triangle_indices]
+correlation_values <- correlation_values[!is.na(correlation_values)]
+
+# Set thresholds for low/high correlation edges (5th and 95th percentiles)
+low_percentile <- 0.05
+high_percentile <- 0.95
+low_thresh <- quantile(correlation_values, probs = low_percentile)
+high_thresh <- quantile(correlation_values, probs = high_percentile)
+
+# Identify low correlation edges
+low_corr_indices_df <- which(correlation_matrix_cleaned < low_thresh, arr.ind = TRUE)
+low_corr_edges <- as.data.frame(low_corr_indices_df) %>%
+  filter(row < col) %>%
+  rename(Node1_Index = row, Node2_Index = col) %>%
+  mutate(CorrelationValue = correlation_matrix_cleaned[cbind(Node1_Index, Node2_Index)]) %>%
+  arrange(CorrelationValue)
+
+# Identify high correlation edges
+high_corr_indices_df <- which(correlation_matrix_cleaned > high_thresh, arr.ind = TRUE)
+high_corr_edges <- as.data.frame(high_corr_indices_df) %>%
+  filter(row < col) %>%
+  rename(Node1_Index = row, Node2_Index = col) %>%
+  mutate(CorrelationValue = correlation_matrix_cleaned[cbind(Node1_Index, Node2_Index)]) %>%
+  arrange(desc(CorrelationValue))
+
+# Construct high/low correlation edge matrices (for MATLAB visualization)
+low_corr_mat <- matrix(0, nrow = 90, ncol = 90)
+for (k in 1:nrow(low_corr_edges)) {
+  i <- low_corr_edges$Node1_Index[k]
+  j <- low_corr_edges$Node2_Index[k]
+  val <- low_corr_edges$CorrelationValue[k]
+  low_corr_mat[i, j] <- val
+  low_corr_mat[j, i] <- val
+}
+
+high_corr_mat <- matrix(0, nrow = 90, ncol = 90)
+for (k in 1:nrow(high_corr_edges)) {
+  i <- high_corr_edges$Node1_Index[k]
+  j <- high_corr_edges$Node2_Index[k]
+  val <- high_corr_edges$CorrelationValue[k]
+  high_corr_mat[i, j] <- val
+  high_corr_mat[j, i] <- val
+}
+
+# Save as .mat files
+# writeMat("GWM_GM_LowCorrEdges.mat", LowCorrMatrix = low_corr_mat)
+# writeMat("GWM_GM_HighCorrEdges.mat", HighCorrMatrix = high_corr_mat)
+# cat("Saved .mat files: GWM_GM_LowCorrEdges.mat, GWM_GM_HighCorrEdges.mat\n")
+```
+
+## Network-Level Similarity Analysis
+
+```{r}
+library(reshape2)
+library(RColorBrewer)
+
+# Load network index labels (AAL 7-network assignment for 90 regions)
+network_index <- read_csv("E:/Neuroimage/MyProject/GMWM_Network/Data/AAL_7networkIndex.csv", col_names = FALSE) %>% as.numeric()
+network_labels <- c('VN', 'SMN', 'AN', 'LB', 'FPN', 'DMN', 'BGN')
+
+# Function to compute intra- and inter-network average connectivity for each subject
+compute_network_connectivity <- function(connectivity_array, network_index) {
+  n_subjects <- dim(connectivity_array)[3]
+  n_networks <- length(unique(network_index))
+  
+  intra_network <- matrix(0, nrow = n_subjects, ncol = n_networks)
+  inter_network <- matrix(0, nrow = n_subjects, ncol = n_networks * (n_networks - 1) / 2)
+  
+  for (subj in 1:n_subjects) {
+    subj_matrix <- connectivity_array[, , subj]
+    # Intra-network
+    for (net in 1:n_networks) {
+      net_indices <- which(network_index == net)
+      intra_values <- subj_matrix[net_indices, net_indices][lower.tri(subj_matrix[net_indices, net_indices])]
+      intra_network[subj, net] <- mean(intra_values, na.rm = TRUE)
+    }
+    # Inter-network
+    inter_idx <- 1
+    for (net1 in 1:(n_networks - 1)) {
+      for (net2 in (net1 + 1):n_networks) {
+        net1_indices <- which(network_index == net1)
+        net2_indices <- which(network_index == net2)
+        inter_values <- subj_matrix[net1_indices, net2_indices]
+        inter_network[subj, inter_idx] <- mean(inter_values, na.rm = TRUE)
+        inter_idx <- inter_idx + 1
+      }
+    }
+  }
+  list(intra_network = intra_network, inter_network = inter_network)
+}
+
+GM_GM_connectivity <- compute_network_connectivity(GM_GM, network_index)
+GWM_HFN_connectivity <- compute_network_connectivity(GWM_HFN, network_index)
+
+# Compute correlation of intra- and inter-network connectivity patterns between methods
+intra_corr <- diag(cor(GM_GM_connectivity$intra_network, GWM_HFN_connectivity$intra_network))
+inter_corr <- cor(GM_GM_connectivity$inter_network, GWM_HFN_connectivity$inter_network)
+
+# Build network-level correlation matrix
+total_networks <- length(network_labels)
+network_corr_matrix <- matrix(NA, nrow = total_networks, ncol = total_networks)
+diag(network_corr_matrix) <- intra_corr
+inter_idx <- 1
+for (i in 1:(total_networks - 1)) {
+  for (j in (i + 1):total_networks) {
+    network_corr_matrix[i, j] <- inter_corr[inter_idx, inter_idx]
+    network_corr_matrix[j, i] <- network_corr_matrix[i, j]
+    inter_idx <- inter_idx + 1
+  }
+}
+colnames(network_corr_matrix) <- network_labels
+rownames(network_corr_matrix) <- network_labels
+
+
+```
+
+## Network-Level Correlation Matrix Visualization
+
+```{r}
+# Prepare data for heatmap
+melted_corr <- melt(network_corr_matrix)
+colnames(melted_corr) <- c("Network1", "Network2", "Correlation")
+melted_corr$Network2 <- factor(melted_corr$Network2, levels = rev(network_labels))
+melted_corr <- melted_corr[order(melted_corr$Network2),]
+
+# Plot heatmap
+correlation_plot <- ggplot(melted_corr, aes(x = Network1, y = Network2, fill = Correlation)) +
+  geom_tile(color = "white", size = 1) +
+  scale_fill_gradient(
+    low = "white", high = "#67000D",
+    name = "Correlation",
+    limits = c(0.7, 0.9)
+  ) +
+  geom_text(aes(label = ifelse(is.na(Correlation), "", round(Correlation, 2))), color = "white", size = 6) +
+  geom_tile(data = subset(melted_corr, Network1 == Network2), color = "black", size = 1.5, fill = NA) +
+  labs(
+    title = "Network-Level Correlation Matrix",
+    subtitle = "Intra- and Inter-Network Correlations",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, vjust = 0.5, size = 16, face = "bold"),
+    axis.text.y = element_text(size = 16, face = "bold"),
+    plot.title = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 18),
+    legend.title = element_text(size = 17, face = "bold"),
+    legend.position = "right",
+    legend.key.height = unit(2.5, "cm"),
+    legend.key.width = unit(0.5, "cm")
+  )
+
+print(correlation_plot)
+# ggsave("../visualization/Figure5_CompareGMGM/NetwokrLevel_Correlation_plot.png",
+#        plot = correlation_plot, width = 7, height = 6.2, units = "in", dpi = 300)
+
+W
+```
+
+## Global-Level Similarity: Mean Connectivity
+
+```{r}
+# Function to compute mean of lower triangle for each subject
+compute_mean_lower_tri <- function(array_3d) {
+  n_subjects <- dim(array_3d)[3]
+  mean_values <- numeric(n_subjects)
+  for (i in 1:n_subjects) {
+    lower_tri_values <- array_3d[, , i][lower.tri(array_3d[, , i])]
+    mean_values[i] <- mean(lower_tri_values)
+  }
+  mean_values
+}
+
+mean_GM_GM <- compute_mean_lower_tri(GM_GM)
+mean_GWM_HFN <- compute_mean_lower_tri(GWM_HFN)
+
+global_corr <- cor(mean_GM_GM, mean_GWM_HFN)
+global_corr_p <- cor.test(mean_GM_GM, mean_GWM_HFN)$p.value
+print(sprintf("Global mean connectivity correlation: r = %.3f, p = %.3e", global_corr, global_corr_p))
+```
+

@@ -1,0 +1,991 @@
+---
+title: "ASD vs TC Group Comparison: GWM-HFN (GM-WM-GM) vs GM-GM (ComBat Adjusted)"
+author: "Your Name"
+date: "`r format(Sys.Date())`"
+output: html_document
+---
+
+```{r 0-setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# 0. Environment and Utility Setup (figure + source data helpers)
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(gghalves)
+  library(broom)
+  library(qvalue)
+  library(neuroCombat)
+  library(purrr)
+  library(ggpubr)
+  library(reshape2)
+  library(patchwork)
+  library(openxlsx)
+})
+
+set.seed(1234)
+
+# Output directories
+dir.create("SourceData", showWarnings = FALSE)
+dir.create("Figures",     showWarnings = FALSE)
+
+SOURCE_XLSX <- "SourceData/SourceData_MainFigures.xlsx"
+
+# Write (create/replace or append) a sheet inside a master Excel workbook
+save_source_data <- function(df, sheet, file = SOURCE_XLSX, overwrite_sheet = TRUE) {
+  stopifnot(is.data.frame(df))
+  if (!file.exists(file)) {
+    wb <- createWorkbook()
+    addWorksheet(wb, sheet)
+    writeData(wb, sheet, df)
+    saveWorkbook(wb, file, overwrite = TRUE)
+    return(invisible(TRUE))
+  }
+  wb <- loadWorkbook(file)
+  if (sheet %in% names(wb)) {
+    if (overwrite_sheet) {
+      removeWorksheet(wb, sheet)
+      addWorksheet(wb, sheet)
+      writeData(wb, sheet, df)
+    } else {
+      old <- readWorkbook(file, sheet = sheet)
+      new <- bind_rows(old, df)
+      removeWorksheet(wb, sheet)
+      addWorksheet(wb, sheet)
+      writeData(wb, sheet, new)
+    }
+  } else {
+    addWorksheet(wb, sheet)
+    writeData(wb, sheet, df)
+  }
+  saveWorkbook(wb, file, overwrite = TRUE)
+  invisible(TRUE)
+}
+
+# Simple CSV writer into SourceData folder
+save_csv_source <- function(df, filename) {
+  write.csv(df, file = file.path("SourceData", filename), row.names = FALSE)
+}
+
+# Unified figure saving helper (TIFF + PDF) for submission
+save_figure <- function(plot_obj, filename_base,
+                        width = 6, height = 5,
+                        dpi = 300) {
+  ggsave(file.path("Figures", paste0(filename_base, ".tiff")),
+         plot_obj, width = width, height = height, dpi = dpi, compression = "lzw")
+  ggsave(file.path("Figures", paste0(filename_base, ".pdf")),
+         plot_obj, width = width, height = height, useDingbats = FALSE)
+}
+```
+
+# 1. Data Loading and Feature Construction (Post-ComBat)
+
+```{r 1-load-data}
+# Helper: flatten lower triangle (excluding diagonal) into row vectors
+flatten_lower <- function(mat_list) {
+  stopifnot(length(mat_list) > 0)
+  lt_idx <- lower.tri(mat_list[[1]], diag = FALSE)
+  do.call(rbind, lapply(mat_list, function(m) m[lt_idx]))
+}
+
+# Helper: mean across each row (subject-level mean connectivity)
+mean_lower <- function(feature_matrix) rowMeans(feature_matrix, na.rm = TRUE)
+
+# Load precomputed objects
+load("./GWM_HFN_combat.RData")
+load("./GM_GM_combat.RData")
+features_GWM_HFN <- flatten_lower(GWM_HFN_combat)
+features_GMGM    <- flatten_lower(GM_GM_combat)
+
+demo <- read.csv("./demographicdata.csv")
+
+# Subject ID alignment (ASD_id / TC_id should be loaded with GMGM_correlation.RData)
+if (!exists("ASD_id") || !exists("TC_id")) {
+  if (file.exists("./GMGM_correlation.RData")) load("./GMGM_correlation.RData")
+}
+
+subject_ids <- c(ASD_id, TC_id)
+
+demo_aligned <- demo %>%
+  filter(SUB_ID %in% subject_ids) %>%
+  arrange(match(SUB_ID, subject_ids))
+stopifnot(all(demo_aligned$SUB_ID == subject_ids))
+
+# Factors / covariates
+labels    <- factor(demo_aligned$DX_GROUP, levels = c(2,1), labels = c("TC","ASD"))
+age       <- demo_aligned$AGE_AT_SCAN
+sex       <- factor(demo_aligned$SEX, levels = c(1,2), labels = c("Male","Female"))
+meanFD    <- demo_aligned$mean.FD_Jenkinson
+site_info <- factor(demo_aligned$SITE_ID)
+
+
+stopifnot(nrow(features_GWM_HFN) == length(labels),
+          nrow(features_GMGM)    == length(labels))
+
+# Edge index mapping (lower triangle)
+lt_template <- lower.tri(matrix(0, 90, 90), diag = FALSE)
+edge_map <- which(lt_template, arr.ind = TRUE)
+```
+
+# 2. Global Mean Connectivity (Figure B)
+
+```{r 2-global-means}
+mean_GWM_HFN <- mean_lower(features_GWM_HFN)
+mean_GMGM    <- mean_lower(features_GMGM)
+
+model_GWM_HFN <- lm(mean_GWM_HFN ~ labels + age + sex + meanFD)
+model_GMGM    <- lm(mean_GMGM    ~ labels + age + sex + meanFD)
+
+tidy_GWM_HFN <- tidy(model_GWM_HFN)
+tidy_GMGM    <- tidy(model_GMGM)
+
+t_val_gwmhfn <- tidy_GWM_HFN$statistic[tidy_GWM_HFN$term == "labelsASD"]
+p_val_gwmhfn <- tidy_GWM_HFN$p.value[tidy_GWM_HFN$term == "labelsASD"]
+
+t_val_gmgm <- tidy_GMGM$statistic[tidy_GMGM$term == "labelsASD"]
+p_val_gmgm <- tidy_GMGM$p.value[tidy_GMGM$term == "labelsASD"]
+
+plot_data_gwm <- data.frame(
+  SubjectID    = subject_ids,
+  Method       = "GWM-HFN",
+  MeanStrength = mean_GWM_HFN,
+  Group        = labels,
+  Age          = age,
+  Sex          = sex,
+  meanFD       = meanFD
+)
+plot_data_gmgm <- data.frame(
+  SubjectID    = subject_ids,
+  Method       = "GM-GM",
+  MeanStrength = mean_GMGM,
+  Group        = labels,
+  Age          = age,
+  Sex          = sex,
+  meanFD       = meanFD
+)
+
+label_counts <- table(plot_data_gwm$Group)
+x_labels <- paste0(names(label_counts), " (n=", as.numeric(label_counts), ")")
+
+p_gwm <- ggplot(plot_data_gwm, aes(x = Group, y = MeanStrength)) +
+  geom_half_violin(side = "l", aes(fill = Group), alpha = 0.8) +
+  geom_half_point(side = "r", aes(fill = Group), alpha = 0.7,
+                  shape = 21, size = 3, color = "black") +
+  geom_boxplot(width = 0.2, fill = "white", color = "black",
+               alpha = 0.8, outlier.color = NA) +
+  scale_x_discrete(labels = x_labels) +
+  scale_fill_manual(values = c("TC" =  rgb(168,216,234, maxColorValue = 255),
+                               "ASD" = rgb(252,186,211, maxColorValue = 255))) +
+  labs(title = "Difference of Mean GWM-HFN",
+       x = NULL, y = "Mean GWM-HFN Strength") +
+  annotate("text",
+           x = 2, y = max(plot_data_gwm$MeanStrength)*1.05,
+           label = sprintf("ASD-TC: t=%.3f, p=%.3f", t_val_gwmhfn, p_val_gwmhfn),
+           size = 5, hjust = 1, fontface = "bold") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x  = element_text(size = 16, face = "bold"),
+    axis.ticks.x = element_blank(),
+    axis.text.y  = element_text(size = 15, face = "bold"),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    plot.title   = element_text(size = 17, face = "bold", hjust = 0.5)
+  )
+
+label_counts2 <- table(plot_data_gmgm$Group)
+x_labels2 <- paste0(names(label_counts2), " (n=", as.numeric(label_counts2), ")")
+
+p_gmgm <- ggplot(plot_data_gmgm, aes(x = Group, y = MeanStrength)) +
+  geom_half_violin(side = "l", aes(fill = Group), alpha = 0.8) +
+  geom_half_point(side = "r", aes(fill = Group), alpha = 0.7,
+                  shape = 21, size = 3, color = "black") +
+  geom_boxplot(width = 0.2, fill = "white", color = "black",
+               alpha = 0.8, outlier.color = NA) +
+  scale_x_discrete(labels = x_labels2) +
+  scale_y_continuous(limits = c(0, 1.5)) +
+  scale_fill_manual(values = c("TC" =  rgb(168,216,234, maxColorValue = 255),
+                               "ASD" = rgb(252,186,211, maxColorValue = 255))) +
+  labs(title = "Difference of Mean GM-GM",
+       x = NULL, y = "Mean GM-GM Strength") +
+  annotate("text",
+           x = 2, y = max(plot_data_gmgm$MeanStrength)*0.60,
+           label = sprintf("ASD-TC: t=%.3f, p=%.3f", t_val_gmgm, p_val_gmgm),
+           size = 5, hjust = 1, fontface = "bold") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x  = element_text(size = 16, face = "bold"),
+    axis.ticks.x = element_blank(),
+    axis.text.y  = element_text(size = 15, face = "bold"),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    plot.title   = element_text(size = 17, face = "bold", hjust = 0.5)
+  )
+
+p_gwm
+p_gmgm
+
+save_figure(p_gwm,  "Figure1A_GlobalMean_GWMHFN", width = 4.8, height = 4.8)
+save_figure(p_gmgm, "Figure1B_GlobalMean_GMGM",   width = 4.8, height = 4.8)
+```
+
+# 3. Vectorized Edgewise Linear Modeling
+
+```{r 3-edgewise-model}
+# Edgewise linear models (standardizing feature & selected covariates)
+regression_results_GWMHFN <- apply(features_GWM_HFN, 2, function(feature_column) {
+  standardized_feature <- scale(feature_column)
+  standardized_age     <- scale(age)
+  standardized_meanFD  <- scale(meanFD)
+  model <- lm(standardized_feature ~ labels + standardized_age + sex + meanFD)
+  tidy(model)
+})
+
+regression_results_GMGM <- apply(features_GMGM, 2, function(feature_column) {
+  standardized_feature <- scale(feature_column)
+  standardized_age     <- scale(age)
+  standardized_meanFD  <- scale(meanFD)
+  model <- lm(standardized_feature ~ labels + standardized_age + sex + meanFD)
+  tidy(model)
+})
+
+# Extract statistics for the ASD vs TC term
+group_coefficients_GWM_HFN <-
+  map_dbl(regression_results_GWMHFN, ~ .x %>% filter(term == "labelsASD") %>% pull(estimate))
+group_tvalue_GWM_HFN <-
+  map_dbl(regression_results_GWMHFN, ~ .x %>% filter(term == "labelsASD") %>% pull(statistic))
+group_pvalues_GWM_HFN <-
+  map_dbl(regression_results_GWMHFN, ~ .x %>% filter(term == "labelsASD") %>% pull(p.value))
+
+group_coefficients_GMGM <-
+  map_dbl(regression_results_GMGM, ~ .x %>% filter(term == "labelsASD") %>% pull(estimate))
+group_tvalue_GMGM <-
+  map_dbl(regression_results_GMGM, ~ .x %>% filter(term == "labelsASD") %>% pull(statistic))
+group_pvalues_GMGM <-
+  map_dbl(regression_results_GMGM, ~ .x %>% filter(term == "labelsASD") %>% pull(p.value))
+
+edge_regression_df <- data.frame(
+  EdgeIndex       = seq_along(group_pvalues_GWM_HFN),
+  Node1           = edge_map[,1],
+  Node2           = edge_map[,2],
+  Beta_GWM_HFN    = group_coefficients_GWM_HFN,
+  t_GWM_HFN       = group_tvalue_GWM_HFN,
+  p_GWM_HFN       = group_pvalues_GWM_HFN,
+  Beta_GMGM       = group_coefficients_GMGM,
+  t_GMGM          = group_tvalue_GMGM,
+  p_GMGM          = group_pvalues_GMGM
+)
+# save_source_data(edge_regression_df, "Figure2_Edgewise_LM")
+```
+
+# 4. Multiple Comparison Correction
+
+```{r 4-multiple-testing}
+fdr_p_GWM_HFN <- p.adjust(group_pvalues_GWM_HFN, method = "fdr")
+fdr_p_GMGM    <- p.adjust(group_pvalues_GMGM,    method = "fdr")
+
+bonf_p_GWM_HFN <- p.adjust(group_pvalues_GWM_HFN, method = "bonferroni")
+bonf_p_GMGM    <- p.adjust(group_pvalues_GMGM,    method = "bonferroni")
+
+qv_GWM_HFN <- qvalue(group_pvalues_GWM_HFN)$qvalues
+qv_GMGM    <- qvalue(group_pvalues_GMGM)$qvalues
+
+sig_counts <- tibble(
+  Network    = c("GWM-HFN","GM-GM"),
+  Bonferroni = c(sum(bonf_p_GWM_HFN < 0.05), sum(bonf_p_GMGM < 0.05)),
+  FDR        = c(sum(fdr_p_GWM_HFN < 0.05),  sum(fdr_p_GMGM < 0.05)),
+  Storey_q   = c(sum(qv_GWM_HFN  < 0.05),    sum(qv_GMGM    < 0.05))
+)
+#  save_source_data(sig_counts, "Figure2_SignificantEdgeCounts")
+sig_counts
+```
+
+# 5. Significant Edge Sets and Overlap
+
+```{r 5-overlap}
+sig_idx_GWM_HFN <- which(qv_GWM_HFN < 0.05)
+sig_idx_GMGM    <- which(qv_GMGM    < 0.05)
+
+only_GWM_HFN <- setdiff(sig_idx_GWM_HFN, sig_idx_GMGM)
+only_GMGM    <- setdiff(sig_idx_GMGM,    sig_idx_GWM_HFN)
+both_sig     <- intersect(sig_idx_GWM_HFN, sig_idx_GMGM)
+
+overlap_summary <- tibble(
+  Category = c("Only GWM-HFN","Only GM-GM","Both"),
+  Count    = c(length(only_GWM_HFN), length(only_GMGM), length(both_sig))
+)
+# save_source_data(overlap_summary, "Figure2_OverlapSummary")
+overlap_summary
+```
+
+# 6. Bidirectional -log10(P) Scatter (Figure D)
+
+```{r 6-p-scatter}
+plotdata <- data.frame(
+  EdgeIndex     = seq_along(group_pvalues_GWM_HFN),
+  Node1         = edge_map[,1],
+  Node2         = edge_map[,2],
+  p_GWMH_log10  = -log10(group_pvalues_GWM_HFN),
+  p_GMGM_log10  = -log10(group_pvalues_GMGM),
+  q_GWMH        = qv_GWM_HFN,
+  q_GMGM        = qv_GMGM
+) %>%
+  mutate(SignificanceClass = factor(
+    case_when(
+      q_GWMH < 0.05 & q_GMGM < 0.05 ~ "Both",
+      q_GWMH < 0.05                 ~ "GWM-HFN",
+      q_GMGM < 0.05                 ~ "GMGM",
+      TRUE                          ~ "Neither"
+    ),
+    levels = c("Both","GWM-HFN","GMGM","Neither")
+  ))
+
+# save_source_data(plotdata, "Figure3_Log10P_ScatterData")
+
+custom_colors <- c(
+  "Both"    = rgb(255,255,210, maxColorValue = 255),
+  "GWM-HFN" = rgb(252,186,211, maxColorValue = 255),
+  "GMGM"    = rgb(168,216,234, maxColorValue = 255),
+  "Neither" = "gray85"
+)
+custom_sizes <- c("Both"=5,"GWM-HFN"=3,"GMGM"=3,"Neither"=2)
+
+xy_lim <- range(c(plotdata$p_GWMH_log10, plotdata$p_GMGM_log10), na.rm = TRUE)
+vline_p <- if (length(sig_idx_GWM_HFN)) max(group_pvalues_GWM_HFN[sig_idx_GWM_HFN]) else NA
+hline_p <- if (length(sig_idx_GMGM))    max(group_pvalues_GMGM[sig_idx_GMGM])    else NA
+
+p_scatter <- ggplot(plotdata, aes(x = p_GWMH_log10, y = p_GMGM_log10, fill = SignificanceClass)) +
+  geom_point(aes(size = SignificanceClass), shape = 21, stroke = 0.5, color = "black", alpha = 0.6) +
+  scale_fill_manual(values = custom_colors) +
+  scale_size_manual(values = custom_sizes) +
+  {if(!is.na(vline_p)) geom_vline(xintercept = -log10(vline_p), linetype = "dashed", color = "red", size = 0.5)} +
+  {if(!is.na(hline_p)) geom_hline(yintercept = -log10(hline_p), linetype = "dashed", color = "red", size = 0.5)} +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", size = 0.7) +
+  scale_x_continuous(limits = xy_lim) +
+  scale_y_continuous(limits = xy_lim) +
+  labs(x = "-log10(P) of GWM-HFN",
+       y = "-log10(P) of GM-GM",
+       fill = "Significance",
+       size = "Significance",
+       title = "Significance of GWM-HFN and GM-GM connectivity") +
+  annotate("text",
+           x = 0.2, y = max(xy_lim),
+           label = sprintf("r = %.3f\np < 0.001",
+                           cor(plotdata$p_GWMH_log10, plotdata$p_GMGM_log10)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold") +
+  theme_bw() +
+  coord_fixed() +
+  theme(
+    legend.position = c(0.89, 0.14),
+    legend.title    = element_text(size = 11, face = "bold"),
+    legend.text     = element_text(size = 10, face = "bold"),
+    legend.background = element_rect(color = "black", size = 0.5),
+    legend.key        = element_rect(color = "black", size = 0.5),
+    axis.text.x    = element_text(size = 15, face = "bold"),
+    axis.text.y    = element_text(size = 15, face = "bold"),
+    axis.title.x   = element_text(size = 17, face = "bold"),
+    axis.title.y   = element_text(size = 17, face = "bold"),
+    plot.title     = element_text(size = 16, face = "bold", hjust = 0.5)
+  )
+
+p_scatter
+# save_figure(p_scatter, "Figure3_Log10P_Scatter", width = 6, height = 6)
+```
+
+# 7. Significant Edge Data Frames
+
+```{r 7-significant-dataframes}
+n_regions <- 90
+
+sig_df_GWM_HFN <- data.frame(
+  EdgeIndex = sig_idx_GWM_HFN,
+  Node1     = edge_map[sig_idx_GWM_HFN, 1],
+  Node2     = edge_map[sig_idx_GWM_HFN, 2],
+  Beta      = group_coefficients_GWM_HFN[sig_idx_GWM_HFN],
+  t         = group_tvalue_GWM_HFN[sig_idx_GWM_HFN],
+  p         = group_pvalues_GWM_HFN[sig_idx_GWM_HFN],
+  q         = qv_GWM_HFN[sig_idx_GWM_HFN],
+  Network   = "GWM-HFN"
+)
+
+sig_df_GMGM <- data.frame(
+  EdgeIndex = sig_idx_GMGM,
+  Node1     = edge_map[sig_idx_GMGM, 1],
+  Node2     = edge_map[sig_idx_GMGM, 2],
+  Beta      = group_coefficients_GMGM[sig_idx_GMGM],
+  t         = group_tvalue_GMGM[sig_idx_GMGM],
+  p         = group_pvalues_GMGM[sig_idx_GMGM],
+  q         = qv_GMGM[sig_idx_GMGM],
+  Network   = "GM-GM"
+)
+
+# save_source_data(sig_df_GWM_HFN, "Figure4A_SignificantEdges_GWM")
+# save_source_data(sig_df_GMGM,    "Figure4B_SignificantEdges_GMGM")
+
+head(sig_df_GWM_HFN)
+```
+
+# 8. Network-Level Edge Count Plot (Figure F)
+
+```{r 8-network-Proportion}
+subnetwork_labels <- read.csv("../../Data/AAL_7networkIndex.csv", header = FALSE) %>% as.numeric()
+network_names <- c("VN","SMN","AN","LB","FPN","DMN","BGN")
+
+# Map significant edge indices to (Node1,Node2)
+as_edge_df <- function(sig_idx_vec, edge_map_mat) {
+  if (length(sig_idx_vec) == 0) {
+    return(tibble(Node1 = integer(), Node2 = integer()))
+  }
+  tibble(
+    Node1 = edge_map_mat[sig_idx_vec, 1],
+    Node2 = edge_map_mat[sig_idx_vec, 2]
+  )
+}
+
+edges_sig_GWM_HFN <- as_edge_df(sig_idx_GWM_HFN, edge_map)
+edges_sig_GMGM    <- as_edge_df(sig_idx_GMGM,    edge_map)
+
+# Denominators per network
+n_per_net   <- sapply(1:length(network_names), function(k) sum(subnetwork_labels == k))
+within_den  <- n_per_net * (n_per_net - 1) / 2        # C(n_k, 2)
+between_den <- n_per_net * (90 - n_per_net)           # Potential external edges (each counted once per network)
+
+# Count within / between and compute proportions
+count_within_between_prop <- function(edges_df, sub_labels, n_per_net, within_den, between_den, network_names) {
+  K <- length(network_names)
+  if (nrow(edges_df) == 0) {
+    return(tibble(
+      Network       = network_names,
+      N_nodes       = n_per_net,
+      Within_Count  = integer(K),
+      Between_Count = integer(K),
+      Within_Den    = within_den,
+      Between_Den   = between_den,
+      Within_Prop   = rep(0, K),
+      Between_Prop  = rep(0, K)
+    ))
+  }
+  net1 <- sub_labels[edges_df$Node1]
+  net2 <- sub_labels[edges_df$Node2]
+  is_within <- (net1 == net2)
+  within_count  <- integer(K)
+  between_count <- integer(K)
+
+  # Within: each edge contributes to exactly one network
+  if (any(is_within)) {
+    tab_w <- table(net1[is_within])
+    within_count[as.integer(names(tab_w))] <- as.integer(tab_w)
+  }
+  # Between: each edge increments both incident networks
+  if (any(!is_within)) {
+    n1b <- net1[!is_within]
+    n2b <- net2[!is_within]
+    for (idx in seq_along(n1b)) {
+      between_count[n1b[idx]] <- between_count[n1b[idx]] + 1
+      between_count[n2b[idx]] <- between_count[n2b[idx]] + 1
+    }
+  }
+  tibble(
+    Network       = network_names,
+    N_nodes       = n_per_net,
+    Within_Count  = within_count,
+    Between_Count = between_count,
+    Within_Den    = within_den,
+    Between_Den   = between_den,
+    Within_Prop   = ifelse(within_den  > 0, within_count  / within_den,  0),
+    Between_Prop  = ifelse(between_den > 0, between_count / between_den, 0)
+  )
+}
+
+props_GWM_HFN <- count_within_between_prop(edges_sig_GWM_HFN,
+                                           subnetwork_labels,
+                                           n_per_net, within_den, between_den,
+                                           network_names) %>% mutate(Type = "GWM-HFN")
+props_GMGM <- count_within_between_prop(edges_sig_GMGM,
+                                        subnetwork_labels,
+                                        n_per_net, within_den, between_den,
+                                        network_names) %>% mutate(Type = "GM-GM")
+
+props_all <- bind_rows(props_GWM_HFN, props_GMGM)
+
+# save_source_data(props_all, "Figure5_NetworkLevel")
+
+# Long format for proportions
+plot_data_long <- props_all %>%
+  select(Network, Type, Within_Prop, Between_Prop) %>%
+  tidyr::pivot_longer(cols = c("Within_Prop","Between_Prop"),
+                      names_to = "Connection_Type",
+                      values_to = "Proportion") %>%
+  mutate(Connection_Type = factor(Connection_Type,
+                                  levels = c("Within_Prop","Between_Prop"),
+                                  labels = c("Within-Network","Between-Network")))
+
+color_map <- c(
+  "GWM-HFN" = rgb(252,186,211, maxColorValue = 255),
+  "GM-GM"   = rgb(168,216,234, maxColorValue = 255)
+)
+
+y_max <- max(plot_data_long$Proportion, na.rm = TRUE)
+p_bar_prop <- ggplot(plot_data_long,
+                     aes(x = Network, y = Proportion, fill = Type)) +
+  geom_bar(stat = "identity",
+           position = position_dodge(width = 0.9),
+           color = "black", width = 0.75) +
+  geom_text(aes(label = sprintf("%.1f%%", 100*Proportion)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4,
+            size = 4.5,
+            fontface = "bold") +
+  scale_fill_manual(values = color_map) +
+  facet_wrap(~Connection_Type, nrow = 1) +
+  scale_y_continuous(limits = c(0, y_max * 1.15),
+                     labels = scales::percent_format(accuracy = 1)) +
+  labs(y = "Proportion of Significant Edges",
+       x = "Network",
+       fill = "Method") +
+  theme_bw(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey90", color = "black"),
+    strip.text       = element_text(size = 18, face = "bold"),
+    axis.text.x      = element_text(size = 18, face = "bold"),
+    axis.text.y      = element_text(size = 18, face = "bold"),
+    axis.title       = element_text(size = 20, face = "bold"),
+    legend.position  = "top",
+    legend.title     = element_text(size = 18, face = "bold"),
+    legend.text      = element_text(size = 17, face = "bold")
+  )
+
+p_bar_prop
+# save_figure(p_bar_prop, "Figure5_NetworkProportions", width = 10, height = 7)
+```
+
+# 8A. 3D/Ortho Network Visualization (brainconn) — Figure E
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(brainconn)
+  library(ggplot2)
+})
+
+# Preconditions: require Section 7 objects
+if (!exists("sig_df_GWM_HFN") || !exists("sig_df_GMGM")) {
+  stop("[8A] sig_df_GWM_HFN or sig_df_GMGM not found. Run Section 7 first.")
+}
+
+# Recompute sets if not present
+if (!exists("only_GWM_HFN") || !exists("only_GMGM") || !exists("both_sig")) {
+  message("[8A] Recomputing only_GWM_HFN / only_GMGM / both_sig ...")
+  if (!exists("qv_GWM_HFN") || !exists("qv_GMGM")) stop("[8A] q-values not found.")
+  sig_idx_GWM_HFN <- which(qv_GWM_HFN < 0.05)
+  sig_idx_GMGM    <- which(qv_GMGM    < 0.05)
+  only_GWM_HFN <- setdiff(sig_idx_GWM_HFN, sig_idx_GMGM)
+  only_GMGM    <- setdiff(sig_idx_GMGM,    sig_idx_GWM_HFN)
+  both_sig     <- intersect(sig_idx_GWM_HFN, sig_idx_GMGM)
+}
+
+# Build category-specific edge data frames
+GMGM_only_df <- sig_df_GMGM %>%
+  filter(!(EdgeIndex %in% sig_idx_GWM_HFN)) %>%
+  transmute(R = Node1, C = Node2, coefficient = Beta)
+
+GWMHFN_only_df <- sig_df_GWM_HFN %>%
+  filter(!(EdgeIndex %in% sig_idx_GMGM)) %>%
+  transmute(R = Node1, C = Node2, coefficient = Beta)
+
+GMGM_GWMHFN_common_df <- inner_join(
+  sig_df_GMGM  %>% select(EdgeIndex, Node1, Node2, Beta) %>% rename(Beta_GMGM = Beta),
+  sig_df_GWM_HFN %>% select(EdgeIndex, Node1, Node2, Beta) %>% rename(Beta_GWMHFN = Beta),
+  by = c("EdgeIndex","Node1","Node2")
+) %>%
+  transmute(R = Node1, C = Node2,
+            coefficient_GMGM    = Beta_GMGM,
+            coefficient_GWMHFN  = Beta_GWMHFN)
+
+# Load atlas + network labels
+if (!exists("aal90")) {
+  data("aal90", package = "brainconn")
+}
+atlas_full <- aal90
+atlas_full$x.mni <- as.integer(atlas_full$x.mni)
+atlas_full$y.mni <- as.integer(atlas_full$y.mni)
+atlas_full$z.mni <- as.integer(atlas_full$z.mni)
+
+
+network_names <- c("VN","SMN","AN","LB","FPN","DMN","BGN")
+atlas_full$network <- network_names[subnetwork_labels]
+
+# Node color palette
+network_color_matrix <- matrix(c(
+  186,  85, 211,
+   70, 130, 180,
+  144, 238, 144,
+  200,   0,   0,
+  255, 140,   0,
+  255, 182, 193,
+  139,  69,  19
+), ncol = 3, byrow = TRUE)/255
+network_colors <- apply(network_color_matrix, 1, function(x) rgb(x[1], x[2], x[3]))
+names(network_colors) <- network_names
+node_colors_all <- network_colors[subnetwork_labels]
+
+# Adjacency builder
+build_adjacency <- function(df, n = 90) {
+  A <- matrix(0, n, n)
+  if (!nrow(df)) return(A)
+  for (k in seq_len(nrow(df))) {
+    i <- df$R[k]; j <- df$C[k]
+    if (i!=j) {
+      A[i,j] <- 1
+      A[j,i] <- 1
+    }
+  }
+  A
+}
+
+adj_GMGM_only   <- build_adjacency(GMGM_only_df)
+adj_GWMHFN_only <- build_adjacency(GWMHFN_only_df)
+adj_common      <- build_adjacency(GMGM_GWMHFN_common_df %>% select(R,C))
+
+# Plot wrapper: crops atlas & color vectors to active nodes
+plot_brain_subset <- function(adj_mat,
+                              atlas_full,
+                              node_colors_full,
+                              edge_color_single = "#CCCCCC",
+                              label_size = 3,
+                              out_file = NULL,
+                              title_str = NULL) {
+  deg <- rowSums(adj_mat != 0)
+  kept <- which(deg > 0)
+  if (!length(kept)) {
+    message("[plot_brain_subset] No edges present. Skipping plot for: ", out_file)
+    return(NULL)
+  }
+  atlas_sub       <- atlas_full[kept, , drop = FALSE]
+  node_colors_sub <- node_colors_full[kept]
+
+  if (nrow(atlas_sub) != length(node_colors_sub)) {
+    stop("[plot_brain_subset] Length mismatch after cropping.")
+  }
+  if (any(is.na(node_colors_sub))) {
+    stop("[plot_brain_subset] NA detected in node_colors_sub.")
+  }
+
+  adj_sub <- adj_mat[kept, kept]
+
+  p <- brainconn(
+    atlas      = atlas_sub,
+    conmat     = adj_sub,
+    node.color = node_colors_sub,
+    all.nodes  = TRUE,
+    edge.color = edge_color_single,
+    labels     = TRUE,
+    label.size = label_size,
+    view       = "ortho"
+  )
+  if (!is.null(title_str)) p <- p + ggtitle(title_str)
+  if (!is.null(out_file)) {
+    ggsave(out_file, p, width = 7, height = 7, dpi = 500)
+  }
+  p
+}
+
+edge_color_GMGM_only   <- "#96DCFA"
+edge_color_GWMHFN_only <- "#FCAFC8"
+edge_color_common      <- "#FAFAC8"
+
+if (!dir.exists("Figures")) dir.create("Figures")
+
+p_GMGM_only <- plot_brain_subset(
+  adj_mat          = adj_GMGM_only,
+  atlas_full       = atlas_full,
+  node_colors_full = node_colors_all,
+  edge_color_single= edge_color_GMGM_only,
+  label_size       = 2.8,
+  out_file         = "Figures/Figure4_Supp_GMGM_only_edges.png",
+  title_str        = "GM-GM Only Significant Edges"
+)
+
+p_GWMHFN_only <- plot_brain_subset(
+  adj_mat          = adj_GWMHFN_only,
+  atlas_full       = atlas_full,
+  node_colors_full = node_colors_all,
+  edge_color_single= edge_color_GWMHFN_only,
+  label_size       = 2.6,
+  out_file         = "Figures/Figure4_Supp_GWMHFN_only_edges.png",
+  title_str        = "GWM-HFN Only Significant Edges"
+)
+
+p_common <- plot_brain_subset(
+  adj_mat          = adj_common,
+  atlas_full       = atlas_full,
+  node_colors_full = node_colors_all,
+  edge_color_single= edge_color_common,
+  label_size       = 2.6,
+  out_file         = "Figures/Figure4_Supp_Common_edges.png",
+  title_str        = "Common Significant Edges"
+)
+
+if (exists("save_source_data")) {
+  if (nrow(GMGM_only_df))           save_source_data(GMGM_only_df,           "Figure4_GMGM_only_edgeList")
+  if (nrow(GWMHFN_only_df))         save_source_data(GWMHFN_only_df,         "Figure4_GWMHFN_only_edgeList")
+  if (nrow(GMGM_GWMHFN_common_df))  save_source_data(GMGM_GWMHFN_common_df,  "Figure4_Common_edgeList")
+}
+
+message("[8A] Brain network visualizations generated (GM-GM only / GWM-HFN only / Common).")
+```
+
+
+
+# 9 Export Masks for Visualization (Supplementary)
+
+```{r 10-export-mats}
+mat_only_GMGM    <- matrix(0, n_regions, n_regions)
+mat_only_GWMHFN  <- matrix(0, n_regions, n_regions)
+mat_both         <- matrix(0, n_regions, n_regions)
+
+fill_edges <- function(idx_vec, target_mat, value = 1) {
+  if (length(idx_vec) == 0) return(target_mat)
+  rc <- edge_map[idx_vec, , drop = FALSE]
+  for (i in seq_len(nrow(rc))) {
+    r <- rc[i,1]; c <- rc[i,2]
+    target_mat[r,c] <- value
+    target_mat[c,r] <- value
+  }
+  target_mat
+}
+
+mat_only_GMGM    <- fill_edges(only_GMGM,    mat_only_GMGM)
+mat_only_GWMHFN  <- fill_edges(only_GWM_HFN, mat_only_GWMHFN)
+mat_both         <- fill_edges(both_sig,     mat_both)
+
+save(mat_only_GMGM, mat_only_GWMHFN, mat_both,
+     file = "SignificantEdgeSets_GWMHFN_vs_GMGM.RData")
+
+edge_list_export <- function(mask_mat, label) {
+  idx <- which(mask_mat[lower.tri(mask_mat)] == 1)
+  df <- data.frame(
+    EdgeIndex = idx,
+    Node1 = edge_map[idx,1],
+    Node2 = edge_map[idx,2],
+    Set = label
+  )
+  df
+}
+mask_df <- bind_rows(
+  edge_list_export(mat_only_GMGM,    "Only_GMGM"),
+  edge_list_export(mat_only_GWMHFN,  "Only_GWMHFN"),
+  edge_list_export(mat_both,         "Both")
+)
+save_source_data(mask_df, "Supp_SignificantEdgeSets")
+```
+
+# 10. Symptom Association  Figure G
+
+```{r 11-symptom, eval=FALSE}
+# 11. Symptom Association (Mean-level Pearson with ADOS Total) — revised: outlier removal + combined plot
+# (Kept disabled; enable eval=TRUE after ADOS variable confirmation)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(cowplot)
+})
+
+message("\n[Section 11] Starting mean-level symptom association (Pearson, ASD only, with GM-GM outlier removal)...")
+
+ados_total_col_candidates <- c("ADOS_G_TOTAL", "ADOS_TOTAL", "ADOS_G_Total", "ADOS_Total")
+ados_total_col <- ados_total_col_candidates[ados_total_col_candidates %in% colnames(demo_aligned)][1]
+if (is.na(ados_total_col)) {
+  stop("Could not find an ADOS total column. Checked: ",
+       paste(ados_total_col_candidates, collapse = ", "),
+       ". Please adjust 'ados_total_col_candidates' to match your data.")
+}
+
+if (!exists("significant_features_idx_GMWMGM")) {
+  significant_features_idx_GMWMGM <- which(qv_GWM_HFN < 0.05)
+}
+if (!exists("significant_features_idx_GMGM")) {
+  significant_features_idx_GMGM <- which(qv_GMGM < 0.05)
+}
+
+asd_mask <- labels == "ASD"
+if (!any(asd_mask)) stop("No ASD subjects detected in 'labels' factor.")
+ados_scores <- demo_aligned[[ados_total_col]][asd_mask]
+
+compute_mean_sig <- function(feature_mat, sig_idx, mask) {
+  if (length(sig_idx) == 0) return(rep(NA_real_, sum(mask)))
+  rowMeans(feature_mat[mask, sig_idx, drop = FALSE], na.rm = TRUE)
+}
+
+mean_conn_GWMHFN <- compute_mean_sig(features_GWM_HFN, significant_features_idx_GMWMGM, asd_mask)
+mean_conn_GMGM   <- compute_mean_sig(features_GMGM,    significant_features_idx_GMGM,   asd_mask)
+
+pearson_safe <- function(x, y) {
+  keep <- complete.cases(x, y)
+  if (sum(keep) < 5) {
+    return(list(r = NA_real_, p = NA_real_, n = sum(keep), keep_index = keep))
+  }
+  ct <- suppressWarnings(cor.test(x[keep], y[keep], method = "pearson"))
+  list(r = unname(ct$estimate), p = ct$p.value, n = sum(keep), keep_index = keep)
+}
+
+# GM-GM outlier detection (z > 3)
+z_thresh <- 3
+manual_outlier_index <- NULL
+
+outlier_info <- tibble()
+if (all(is.na(mean_conn_GMGM))) {
+  message("[Outlier] Skipping detection: GM-GM mean connectivity is all NA (no significant edges).")
+  mean_conn_GMGM_clean <- mean_conn_GMGM
+  ados_scores_clean    <- ados_scores
+} else {
+  z_vals <- as.numeric(scale(mean_conn_GMGM))
+  auto_outliers <- which(z_vals > z_thresh)
+  outliers_final <- if (!is.null(manual_outlier_index)) sort(unique(manual_outlier_index)) else auto_outliers
+  if (length(outliers_final)) {
+    message(sprintf("[Outlier] Detected %d GM-GM outlier(s) (z > %.2f) removed.", length(outliers_final), z_thresh))
+    subj_ids_asd <- if (exists("subject_ids")) subject_ids[asd_mask] else rep(NA_character_, sum(asd_mask))
+    outlier_info <- tibble(
+      Removed_Index_ASD_Subset = outliers_final,
+      MeanConn_GMGM            = mean_conn_GMGM[outliers_final],
+      Zscore_GMGM              = z_vals[outliers_final],
+      ADOS_Total               = ados_scores[outliers_final],
+      Subject_ID               = if (!is.null(subj_ids_asd)) subj_ids_asd[outliers_final] else NA_character_
+    )
+    mean_conn_GMGM_clean <- mean_conn_GMGM
+    ados_scores_clean    <- ados_scores
+    mean_conn_GMGM_clean[outliers_final] <- NA
+    ados_scores_clean[outliers_final]    <- NA
+  } else {
+    message("[Outlier] No GM-GM outliers detected.")
+    mean_conn_GMGM_clean <- mean_conn_GMGM
+    ados_scores_clean    <- ados_scores
+  }
+}
+
+res_GWMHFN <- pearson_safe(mean_conn_GWMHFN, ados_scores)
+res_GMGM   <- pearson_safe(mean_conn_GMGM_clean, ados_scores_clean)
+
+result_table <- tibble(
+  Method = c("GWM-HFN", "GM-GM"),
+  SigEdgeCount = c(length(significant_features_idx_GMWMGM),
+                   length(significant_features_idx_GMGM)),
+  Pearson_r = c(res_GWMHFN$r, res_GMGM$r),
+  P_value   = c(res_GWMHFN$p, res_GMGM$p),
+  N_ASD     = c(res_GWMHFN$n, res_GMGM$n),
+  Outliers_Removed = c(0, ifelse(length(outlier_info$Removed_Index_ASD_Subset)==0, 0, length(outlier_info$Removed_Index_ASD_Subset)))
+) %>%
+  mutate(FDR = p.adjust(P_value, method = "fdr"))
+
+print(result_table)
+
+if (exists("save_source_data")) {
+  save_source_data(result_table, "Figure11_Symptom_MeanLevel_Pearson")
+  if (nrow(outlier_info)) save_source_data(outlier_info, "Figure11_Symptom_MeanLevel")
+}
+
+plot_mean_symptom <- function(mean_conn, ados, r, pval, method_label,
+                              color_fill, n_ASD, tag_label = NULL,
+                              ados_col_name = ados_total_col) {
+  if (all(is.na(mean_conn))) {
+    message("[Plot] Skipping ", method_label, ": no significant edges or all NA after outlier removal.")
+    return(ggplot() + theme_void() + ggtitle(paste("No data:", method_label)))
+  }
+  df_plot <- data.frame(MeanConn = mean_conn,
+                        ADOS_Total = ados)
+  keep <- complete.cases(df_plot)
+  if (sum(keep) < 5) {
+    message("[Plot] Skipping ", method_label, ": <5 complete cases after outlier removal.")
+    return(ggplot() + theme_void() + ggtitle(paste("Insufficient data:", method_label)))
+  }
+  ann_text <- sprintf("r = %.2f\np = %.3g", r, pval)
+  p <- ggplot(df_plot, aes(x = MeanConn, y = ADOS_Total)) +
+    geom_point(shape = 21,
+               fill = color_fill,
+               color = "black",
+               stroke = 0.5,
+               size = 4.2,
+               alpha = 0.9) +
+    geom_smooth(method = "lm", se = TRUE, color = "red") +
+    labs(
+      title = sprintf("Mean %s vs ADOS Total (n=%d)", method_label, n_ASD),
+      x = sprintf("Mean %s Significant Edge", method_label),
+      y = ados_col_name
+    ) +
+    annotate("text", x = Inf, y = Inf,
+             label = ann_text,
+             hjust = 1.1, vjust = 1.5,
+             size = 5.5, fontface = "bold") +
+    theme_bw() +
+    theme(
+      axis.text  = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 16, face = "bold"),
+      plot.title = element_text(size = 17, face = "bold", hjust = 0),
+      legend.position = "none",
+      axis.ticks.length = unit(0, "mm"),
+      plot.tag = element_text(size = 16, face = "bold")
+    )
+  if (!is.null(tag_label)) p <- p + labs(tag = tag_label)
+  return(p)
+}
+
+if (!dir.exists("Figures")) dir.create("Figures")
+
+plot_gwmhfn <- plot_mean_symptom(
+  mean_conn_GWMHFN, ados_scores,
+  res_GWMHFN$r, res_GWMHFN$p,
+  "GWM-HFN",
+  color_fill = rgb(252,186,211, maxColorValue = 255),
+  n_ASD = res_GWMHFN$n
+)
+
+plot_gmgm <- plot_mean_symptom(
+  mean_conn_GMGM_clean, ados_scores_clean,
+  res_GMGM$r, res_GMGM$p,
+  "GM-GM",
+  color_fill = rgb(168,216,234, maxColorValue = 255),
+  n_ASD = res_GMGM$n
+)
+
+combined_plot <- plot_grid(plot_gwmhfn, plot_gmgm, nrow = 1, align = "hv")
+save_figure(combined_plot, "Figure11_Combined_MeanConn_ADOS", width = 10, height = 6, dpi = 300)
+
+if (exists("save_source_data")) {
+  df_gwm  <- data.frame(MeanConn = mean_conn_GWMHFN,  ADOS_Total = ados_scores)
+  df_gmgm <- data.frame(MeanConn = mean_conn_GMGM_clean, ADOS_Total = ados_scores_clean)
+  save_source_data(df_gwm,  "Figure11A_MeanGWMHFN_ADOS_PlotData_Pearson")
+  save_source_data(df_gmgm, "Figure11B_MeanGMGM_ADOS_PlotData_Pearson_Cleaned")
+}
+
+message("[Section 11] Completed mean-level ADOS association analysis (Pearson, with GM-GM outlier handling).")
+## ====================== END OF OPTIONAL BLOCK ======================
+```
+
+# 11. Save Summary Objects
+
+```{r 12-save}
+summary_tables <- list(
+  Global_GWM_HFN   = tidy_GWM_HFN,
+  Global_GMGM      = tidy_GMGM,
+  Edge_Sig_Counts  = sig_counts,
+  Overlap          = overlap_summary
+)
+
+save(summary_tables,
+     group_coefficients_GWM_HFN, group_pvalues_GWM_HFN, qv_GWM_HFN,
+     group_coefficients_GMGM,    group_pvalues_GMGM,    qv_GMGM,
+     sig_df_GWM_HFN, sig_df_GMGM,
+     file = "GroupComparison_Results_GWMHFN_vs_GMGM.RData")
+
+master_summary_df <- bind_rows(
+  mutate(sig_counts, Table = "SigCounts"),
+  mutate(overlap_summary, Table = "Overlap")
+)
+save_source_data(master_summary_df, "Master_SummaryTables")
+```
+
+
+All plots are written to Figures (TIFF + PDF) and their underlying numerical data to SourceData (Excel sheets / CSV). This version standardizes figure saving, source-data export, and annotation style.
